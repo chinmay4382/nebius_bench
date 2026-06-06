@@ -32,7 +32,7 @@ from database.repository import (
 )
 from orchestrator.create_endpoint import create_endpoint
 from orchestrator.delete_endpoint import delete_endpoint
-from orchestrator.get_status import EndpointState, EndpointStatus, get_endpoint_status
+from orchestrator.get_status import EndpointState, EndpointStatus, check_serve_ready, get_endpoint_status
 from orchestrator.nebius_client import NebiusClientError
 from reports.html_report import generate_html_report
 from reports.json_report import generate_json_report
@@ -177,8 +177,8 @@ def _init_session() -> None:
         "deletion_result": None, "error_message": None, "selected_platform": None,
         "selected_engine": "vllm",
         "current_run_id": None, "run_saved": False,
-        "create_job": None, "poll_job": None, "bench_job": None,
-        "delete_job": None, "conc_job": None,
+        "create_job": None, "poll_job": None, "warmup_job": None,
+        "bench_job": None, "delete_job": None, "conc_job": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -562,15 +562,34 @@ def _section_creating() -> None:
     st.info("⏳ Submitting endpoint creation request…")
     if job.get("done"):
         if job.get("error"):
-            st.session_state.workflow = "error"; st.session_state.error_message = job["error"]
+            st.session_state.workflow = "error"
+            st.session_state.error_message = job["error"]
         else:
             r = job["result"]
             st.session_state.endpoint_id       = r.endpoint_id
             st.session_state.creation_duration = r.creation_duration_seconds
-            _spawn_poll(r.endpoint_id)
+            st.session_state.workflow          = "submitted"
         st.rerun()
     else:
         time.sleep(REFRESH_INTERVAL); st.rerun()
+
+
+def _section_submitted() -> None:
+    cfg = st.session_state.model_config or {}
+    eid = st.session_state.endpoint_id or "—"
+
+    st.success("✅ Request sent successfully!")
+    st.markdown(
+        f"**{cfg.get('display_name', 'Endpoint')}** has been submitted for deployment.  \n"
+        f"Endpoint ID: `{eid}`"
+    )
+    st.info("Provisioning typically takes 5–10 minutes. Head to **Endpoint Management** to monitor the status.")
+    st.page_link("pages/6_Endpoint_Management.py", label="📡 Go to Endpoint Management →", use_container_width=False)
+    st.divider()
+    if st.button("↩ Deploy another endpoint"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
 
 
 def _section_polling() -> None:
@@ -587,8 +606,49 @@ def _section_polling() -> None:
         else:
             st.session_state.endpoint_url  = job["url"]
             st.session_state.auth_token    = job["auth_token"]
-            st.session_state.time_to_ready = time.time() - (st.session_state.op_start or time.time())
-            st.session_state.workflow      = "ready"
+            st.session_state.workflow      = "warming"
+            st.session_state.op_start      = time.time()
+        st.rerun()
+    else:
+        time.sleep(REFRESH_INTERVAL); st.rerun()
+
+
+def _spawn_warmup(endpoint_url: str, auth_token: str | None) -> None:
+    job: dict[str, Any] = {"done": False, "ready": False, "error": None}
+    st.session_state.warmup_job = job
+
+    def _run() -> None:
+        while not job["done"]:
+            if check_serve_ready(endpoint_url, auth_token):
+                job["ready"] = True
+                job["done"]  = True
+            else:
+                time.sleep(POLL_INTERVAL)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _section_warming() -> None:
+    job = st.session_state.get("warmup_job") or {}
+    _status_card()
+
+    if not job:
+        _spawn_warmup(st.session_state.endpoint_url, st.session_state.auth_token)
+        st.rerun()
+
+    elapsed = _elapsed(st.session_state.op_start)
+    st.info(f"🟡 **Container up** — vLLM is loading the model into GPU memory… ({elapsed})")
+    st.caption("The endpoint will be ready to serve once `/v1/models` responds. This usually takes 2–4 minutes after the VM starts.")
+
+    if job.get("done"):
+        if job.get("ready"):
+            st.session_state.time_to_ready = (
+                (st.session_state.get("creation_duration") or 0) +
+                (time.time() - (st.session_state.op_start or time.time()))
+            )
+            st.session_state.workflow = "ready"
+        else:
+            st.session_state.workflow = "error"
+            st.session_state.error_message = job.get("error") or "Warmup failed"
         st.rerun()
     else:
         time.sleep(REFRESH_INTERVAL); st.rerun()
@@ -754,10 +814,12 @@ def main() -> None:
     w = st.session_state.workflow
 
     st.header("1. Endpoint Deployment")
-    if w == "idle":        _section_idle(models)
-    elif w == "creating":  _section_creating()
-    elif w == "polling":   _section_polling()
-    elif w == "ready":     _section_ready()
+    if w == "idle":          _section_idle(models)
+    elif w == "creating":    _section_creating()
+    elif w == "submitted":   _section_submitted()
+    elif w == "polling":     _section_polling()
+    elif w == "warming":     _section_warming()
+    elif w == "ready":       _section_ready()
     elif w == "benchmarking": _section_benchmarking()
     elif w == "results":   _section_results()
     elif w == "deleting":  _section_deleting()

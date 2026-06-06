@@ -37,14 +37,15 @@ def _parse_one(item: dict) -> EndpointInfo:
     public_eps = status.get("public_endpoints", [])
     url = f"http://{public_eps[0]}" if public_eps else None
 
-    # Model from vLLM args
+    # Model from server args — check served-model-name first (works for both
+    # vLLM and SGLang), then fall back to --model-path (SGLang) or --model (vLLM).
     args = spec.get("args", "")
     model: str | None = None
     served = re.search(r"--served-model-name\s+(\S+)", args)
     if served:
         model = served.group(1)
     else:
-        m = re.search(r"--model\s+(\S+)", args)
+        m = re.search(r"--model-path\s+(\S+)", args) or re.search(r"--model\s+(\S+)", args)
         if m:
             model = m.group(1)
 
