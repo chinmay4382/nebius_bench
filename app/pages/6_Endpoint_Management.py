@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -13,7 +14,7 @@ ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from orchestrator.delete_endpoint import delete_endpoint
-from orchestrator.get_status import EndpointState
+from orchestrator.get_status import EndpointState, check_serve_ready
 from orchestrator.list_endpoints import EndpointInfo, list_endpoints
 from orchestrator.nebius_client import NebiusClientError
 
@@ -34,6 +35,29 @@ _STATE_BADGE = {
     EndpointState.ERROR:        ("🔴", "ERROR",        "#4a1212"),
     EndpointState.UNKNOWN:      ("⚪", "UNKNOWN",      "#2a2a2a"),
 }
+
+_SERVE_CHECK_TTL = 30  # seconds between health-check refreshes per endpoint
+
+
+def _serve_badge(ep: EndpointInfo) -> tuple[str, str, str]:
+    """Synchronous health-check badge for RUNNING endpoints.
+
+    A 502/refused connection returns in <50ms; a ready server in <200ms.
+    Results are cached in session state for _SERVE_CHECK_TTL seconds so
+    subsequent reruns are instant.
+    """
+    cache_key = f"serve_ready_{ep.endpoint_id}"
+    ts_key    = f"serve_ready_ts_{ep.endpoint_id}"
+
+    cached_at = st.session_state.get(ts_key, 0)
+    if cache_key not in st.session_state or time.time() - cached_at > _SERVE_CHECK_TTL:
+        ready = check_serve_ready(ep.url or "", ep.auth_token, timeout=1)
+        st.session_state[cache_key] = ready
+        st.session_state[ts_key]    = time.time()
+
+    if st.session_state[cache_key]:
+        return ("🟢", "READY TO SERVE", "#1a4731")
+    return ("🟡", "CONTAINER UP", "#2a3d06")
 
 
 def _fmt_ts(ts: str | None) -> str:
@@ -62,8 +86,8 @@ def _handoff(ep: EndpointInfo) -> None:
     st.session_state["time_to_ready"]      = 0.0
     st.session_state["op_start"]           = time.time()
     st.session_state["selected_platform"]  = ep.platform
-    for k in ("create_job", "poll_job", "bench_job", "delete_job", "deletion_result",
-              "current_run_id", "run_saved", "conc_job"):
+    for k in ("create_job", "poll_job", "warmup_job", "bench_job", "delete_job",
+              "deletion_result", "current_run_id", "run_saved", "conc_job"):
         st.session_state[k] = None
     st.switch_page("pages/1_Deploy_and_Run.py")
 
@@ -88,12 +112,153 @@ def _spawn_delete(endpoint_id: str) -> dict:
     return job
 
 
+def _render_test_panel(ep: EndpointInfo) -> None:
+    """Inline API test panel for a running endpoint."""
+    from openai import OpenAI
+
+    eid = ep.endpoint_id
+    with st.expander("🧪 Test API", expanded=False):
+
+        # ── Controls ────────────────────────────────────────────────────────
+        c1, c2, c3 = st.columns([3, 2, 2])
+        with c1:
+            model_name = st.text_input(
+                "Model name", value=ep.model or "",
+                key=f"t_model_{eid}",
+                help="The served_model_name the endpoint was started with.",
+            )
+        with c2:
+            temperature = st.slider(
+                "Temperature", 0.0, 2.0, 0.7, 0.05, key=f"t_temp_{eid}",
+            )
+        with c3:
+            max_tokens = st.number_input(
+                "Max tokens", min_value=1, max_value=4096, value=256, step=64,
+                key=f"t_maxtok_{eid}",
+            )
+
+        with st.expander("System prompt (optional)", expanded=False):
+            system_prompt = st.text_area(
+                "System prompt", value="", key=f"t_sys_{eid}",
+                placeholder="You are a helpful assistant.",
+                label_visibility="collapsed",
+            )
+
+        prompt = st.text_area(
+            "User prompt", value="Hello! Briefly describe what you can do.",
+            key=f"t_prompt_{eid}", height=80,
+        )
+
+        ctl1, ctl2, ctl3 = st.columns([2, 2, 2])
+        with ctl1:
+            streaming = st.checkbox("Streaming", value=True, key=f"t_stream_{eid}")
+        with ctl2:
+            show_raw = st.checkbox("Show raw JSON", value=False, key=f"t_raw_{eid}")
+        with ctl3:
+            send = st.button(
+                "▶ Send", key=f"t_send_{eid}",
+                type="primary", use_container_width=True,
+                disabled=not model_name.strip(),
+            )
+
+        if not send:
+            return
+
+        # ── Build client ─────────────────────────────────────────────────────
+        api_key  = ep.auth_token or os.getenv("NEBIUS_API_KEY") or "dummy"
+        base_url = (ep.url or "").rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
+
+        if not base_url or base_url == "/v1":
+            st.error("Endpoint has no public URL — cannot send request.")
+            return
+
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
+        messages = []
+        if system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt.strip()})
+        messages.append({"role": "user", "content": prompt})
+
+        st.divider()
+
+        # ── Streaming ────────────────────────────────────────────────────────
+        if streaming:
+            response_placeholder = st.empty()
+            metrics_placeholder  = st.empty()
+            collected            = []
+            ttft_ms: float | None = None
+            t0 = time.perf_counter()
+
+            try:
+                with st.spinner("Waiting for first token…"):
+                    stream = client.chat.completions.create(
+                        model=model_name.strip(),
+                        messages=messages,
+                        max_tokens=int(max_tokens),
+                        temperature=temperature,
+                        stream=True,
+                    )
+
+                for chunk in stream:
+                    delta = (chunk.choices or [{}])[0]
+                    content = getattr(getattr(delta, "delta", None), "content", None) or ""
+                    if content:
+                        if ttft_ms is None:
+                            ttft_ms = (time.perf_counter() - t0) * 1000
+                        collected.append(content)
+                        response_placeholder.code("".join(collected), language=None)
+
+                total_ms = (time.perf_counter() - t0) * 1000
+                m1, m2 = metrics_placeholder.columns(2)
+                m1.metric("TTFT", f"{ttft_ms:.0f} ms" if ttft_ms else "—")
+                m2.metric("Total time", f"{total_ms:.0f} ms")
+
+            except Exception as exc:
+                st.error(f"Request failed: {exc}")
+
+        # ── Non-streaming ─────────────────────────────────────────────────────
+        else:
+            t0 = time.perf_counter()
+            try:
+                with st.spinner("Waiting for response…"):
+                    resp = client.chat.completions.create(
+                        model=model_name.strip(),
+                        messages=messages,
+                        max_tokens=int(max_tokens),
+                        temperature=temperature,
+                        stream=False,
+                    )
+                total_ms = (time.perf_counter() - t0) * 1000
+                content  = (resp.choices[0].message.content or "") if resp.choices else ""
+
+                st.code(content, language=None)
+
+                usage = resp.usage
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Total time",        f"{total_ms:.0f} ms")
+                mc2.metric("Prompt tokens",     usage.prompt_tokens      if usage else "—")
+                mc3.metric("Completion tokens", usage.completion_tokens  if usage else "—")
+                mc4.metric("Total tokens",      usage.total_tokens       if usage else "—")
+
+                if show_raw:
+                    st.json(resp.model_dump())
+
+            except Exception as exc:
+                st.error(f"Request failed: {exc}")
+
+
 def _render_card(ep: EndpointInfo) -> None:
     is_running   = ep.state == EndpointState.RUNNING
     is_transient = ep.state.is_transient
     is_error     = ep.state in (EndpointState.FAILED, EndpointState.UNKNOWN) or ep.state.value == "ERROR"
 
-    icon, label, bg = _STATE_BADGE.get(ep.state, ("⚪", ep.state.value, "#2a2a2a"))
+    if ep.state == EndpointState.RUNNING:
+        icon, label, bg = _serve_badge(ep)
+    else:
+        icon, label, bg = _STATE_BADGE.get(ep.state, ("⚪", ep.state.value, "#2a2a2a"))
+
+    is_serve_ready = label == "READY TO SERVE"
 
     confirm_key  = f"confirm_delete_{ep.endpoint_id}"
     deleting_key = f"deleting_{ep.endpoint_id}"
@@ -121,10 +286,12 @@ def _render_card(ep: EndpointInfo) -> None:
             )
 
         with col_bench:
-            if is_running:
+            if is_serve_ready:
                 if st.button("▶ Benchmark", key=f"bench_{ep.endpoint_id}",
                              type="primary", use_container_width=True):
                     _handoff(ep)
+            elif is_running:
+                st.caption("Loading…")
             elif is_transient:
                 st.caption("Starting…")
 
@@ -180,6 +347,9 @@ def _render_card(ep: EndpointInfo) -> None:
         if ep.image:
             with st.expander("Container image", expanded=False):
                 st.code(ep.image, language="text")
+
+        if is_running and ep.url:
+            _render_test_panel(ep)
 
 
 # ── Also handle "ERROR" state in EndpointState ─────────────────────────────────

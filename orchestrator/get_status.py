@@ -1,5 +1,7 @@
 import logging
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum
 
@@ -74,6 +76,19 @@ def _extract_model(response: dict) -> str | None:
         return model.group(1)
 
     return None
+
+
+def check_serve_ready(url: str, auth_token: str | None, timeout: int = 5) -> bool:
+    """Return True if the endpoint's /v1/models responds with HTTP 200."""
+    target = url.rstrip("/") + "/v1/models"
+    req = urllib.request.Request(target)
+    if auth_token:
+        req.add_header("Authorization", f"Bearer {auth_token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 
 def get_endpoint_status(endpoint_id: str) -> EndpointStatus:
