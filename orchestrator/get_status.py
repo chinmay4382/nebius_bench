@@ -78,17 +78,30 @@ def _extract_model(response: dict) -> str | None:
     return None
 
 
-def check_serve_ready(url: str, auth_token: str | None, timeout: int = 5) -> bool:
-    """Return True if the endpoint's /v1/models responds with HTTP 200."""
+def check_serve_ready(url: str, auth_token: str | None, timeout: int = 5) -> tuple[bool, str]:
+    """Return (ready, detail) — hits /v1/models and explains what happened."""
+    if not url:
+        return False, "No public URL yet"
     target = url.rstrip("/") + "/v1/models"
     req = urllib.request.Request(target)
     if auth_token:
         req.add_header("Authorization", f"Bearer {auth_token}")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+            if resp.status == 200:
+                return True, "OK"
+            return False, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code} {exc.reason}"
+    except urllib.error.URLError as exc:
+        reason = str(exc.reason)
+        if "Connection refused" in reason:
+            return False, "Connection refused — model still loading"
+        if "timed out" in reason.lower():
+            return False, "Timed out — model still loading"
+        return False, reason
+    except Exception as exc:
+        return False, str(exc)[:80]
 
 
 def get_endpoint_status(endpoint_id: str) -> EndpointStatus:

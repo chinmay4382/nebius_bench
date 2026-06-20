@@ -36,25 +36,59 @@ def _build_engine_args(
     served_model_name: str,
     max_model_len: int,
     gpu_count: int,
+    # shared
+    quantization: str | None = None,
+    dtype: str = "auto",
+    # vLLM-specific
+    gpu_memory_utilization: float = 0.90,
+    enable_prefix_caching: bool = False,
+    max_num_seqs: int | None = None,
+    # SGLang-specific
+    mem_fraction_static: float = 0.88,
+    disable_radix_cache: bool = False,
+    max_running_requests: int | None = None,
+    attention_backend: str = "flashinfer",
 ) -> str:
     if engine == "sglang":
         tp = f" --tp {gpu_count}" if gpu_count > 1 else ""
-        return (
+        args = (
             f"--model-path {model_id} "
             f"--served-model-name {served_model_name} "
             f"--max-total-tokens {max_model_len} "
             f"--host 0.0.0.0 "
-            f"--port 8000{tp}"
+            f"--port 8000"
+            f"{tp}"
+            f" --dtype {dtype}"
+            f" --mem-fraction-static {mem_fraction_static}"
+            f" --attention-backend {attention_backend}"
         )
-    # vllm (default)
+        if quantization and quantization != "none":
+            args += f" --quantization {quantization}"
+        if disable_radix_cache:
+            args += " --disable-radix-cache"
+        if max_running_requests is not None:
+            args += f" --max-running-requests {max_running_requests}"
+        return args
+
+    # vllm
     tp = f" --tensor-parallel-size {gpu_count}" if gpu_count > 1 else ""
-    return (
+    args = (
         f"--model {model_id} "
         f"--served-model-name {served_model_name} "
         f"--max-model-len {max_model_len} "
         f"--host 0.0.0.0 "
-        f"--port 8000{tp}"
+        f"--port 8000"
+        f"{tp}"
+        f" --dtype {dtype}"
+        f" --gpu-memory-utilization {gpu_memory_utilization}"
     )
+    if quantization and quantization != "none":
+        args += f" --quantization {quantization}"
+    if enable_prefix_caching:
+        args += " --enable-prefix-caching"
+    if max_num_seqs is not None:
+        args += f" --max-num-seqs {max_num_seqs}"
+    return args
 
 
 def resolve_preset(gpu_count: int, platform: str) -> str:
@@ -93,6 +127,16 @@ def create_endpoint(
     name: str | None = None,
     hf_token: str | None = None,
     engine: str = "vllm",
+    image_tag: str = "latest",
+    quantization: str | None = None,
+    dtype: str = "auto",
+    gpu_memory_utilization: float = 0.90,
+    enable_prefix_caching: bool = False,
+    max_num_seqs: int | None = None,
+    mem_fraction_static: float = 0.88,
+    disable_radix_cache: bool = False,
+    max_running_requests: int | None = None,
+    attention_backend: str = "flashinfer",
 ) -> EndpointCreationResult:
     """Create a Nebius AI endpoint using vLLM or SGLang for the given model."""
     preset = resolve_preset(gpu_count, platform)
@@ -105,8 +149,24 @@ def create_endpoint(
 
     request_timestamp = time.time()
 
-    effective_image = ENGINE_IMAGES.get(engine, image)
-    engine_args = _build_engine_args(engine, model_id, served_model_name, max_model_len, gpu_count)
+    base_image = ENGINE_IMAGES.get(engine, image)
+    # Allow pinning a specific image tag (e.g. v0.8.5 instead of latest)
+    if ":" in base_image:
+        base_image = base_image.rsplit(":", 1)[0]
+    effective_image = f"{base_image}:{image_tag}"
+
+    engine_args = _build_engine_args(
+        engine, model_id, served_model_name, max_model_len, gpu_count,
+        quantization=quantization,
+        dtype=dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enable_prefix_caching=enable_prefix_caching,
+        max_num_seqs=max_num_seqs,
+        mem_fraction_static=mem_fraction_static,
+        disable_radix_cache=disable_radix_cache,
+        max_running_requests=max_running_requests,
+        attention_backend=attention_backend,
+    )
 
     cmd_args: list[str] = [
         "ai", "endpoint", "create",

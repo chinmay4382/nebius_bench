@@ -57,6 +57,17 @@ GPU_PLATFORMS: list[dict[str, Any]] = [
 ]
 _PLATFORM_BY_ID = {p["id"]: p for p in GPU_PLATFORMS}
 
+# Nebius on-demand GPU pricing (USD per GPU per hour, as of June 2026)
+# Source: https://nebius.com/prices
+GPU_PRICE_PER_HOUR: dict[str, float] = {
+    "gpu-h200-sxm": 2.45,
+    "gpu-b200-sxm": 3.95,
+    "gpu-rtx6000":  0.95,
+}
+# Typical end-to-end benchmark session duration in hours
+# (create ~1 min + model load ~8 min + benchmark ~3 min + delete ~1 min)
+_ESTIMATED_SESSION_HOURS = 13 / 60
+
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
 
@@ -194,6 +205,16 @@ def _spawn_create(
     engine: str = "vllm",
     gpu_count_override: int | None = None,
     disk_size_override: str | None = None,
+    image_tag: str = "latest",
+    quantization: str | None = None,
+    dtype: str = "auto",
+    gpu_memory_utilization: float = 0.90,
+    enable_prefix_caching: bool = False,
+    max_num_seqs: int | None = None,
+    mem_fraction_static: float = 0.88,
+    disable_radix_cache: bool = False,
+    max_running_requests: int | None = None,
+    attention_backend: str = "flashinfer",
 ) -> None:
     job: dict[str, Any] = {"done": False, "result": None, "error": None}
     st.session_state.create_job        = job
@@ -201,7 +222,7 @@ def _spawn_create(
     st.session_state.workflow          = "creating"
     st.session_state.selected_platform = platform_override or cfg["platform"]
     st.session_state.selected_engine   = engine
-    effective_platform = platform_override or cfg["platform"]
+    effective_platform  = platform_override or cfg["platform"]
     effective_gpu_count = gpu_count_override if gpu_count_override is not None else cfg.get("gpu_count", 1)
     effective_disk_size = disk_size_override or cfg.get("disk_size", "250Gi")
 
@@ -216,6 +237,16 @@ def _spawn_create(
                 disk_size=effective_disk_size,
                 hf_token=hf_token or None,
                 engine=engine,
+                image_tag=image_tag,
+                quantization=quantization if quantization != "none" else None,
+                dtype=dtype,
+                gpu_memory_utilization=gpu_memory_utilization,
+                enable_prefix_caching=enable_prefix_caching,
+                max_num_seqs=max_num_seqs if max_num_seqs and max_num_seqs > 0 else None,
+                mem_fraction_static=mem_fraction_static,
+                disable_radix_cache=disable_radix_cache,
+                max_running_requests=max_running_requests if max_running_requests and max_running_requests > 0 else None,
+                attention_backend=attention_backend,
             )
             job["result"] = result
         except Exception as exc:
@@ -434,7 +465,92 @@ def _download_buttons(results: BenchmarkResults, conc_data: list | None = None) 
 
 # ── section renderers ──────────────────────────────────────────────────────────
 
-def _section_idle(models: list[dict[str, Any]]) -> None:
+def _hf_size_to_disk(size_bytes: int | None) -> str:
+    """Estimate disk size from safetensors total bytes, with 30% headroom."""
+    if not size_bytes:
+        return "250Gi"
+    gb = size_bytes / 1_073_741_824  # bytes → GiB
+    padded = gb * 1.3
+    if padded <= 120:
+        return "120Gi"
+    if padded <= 200:
+        return f"{int(padded // 10 * 10 + 10)}Gi"
+    if padded <= 500:
+        return f"{int(padded // 50 * 50 + 50)}Gi"
+    if padded <= 1024:
+        return "1Ti"
+    return "2Ti"
+
+
+def _hf_model_to_cfg(model: Any) -> dict[str, Any]:
+    """Convert a HuggingFace ModelInfo object into a model config dict."""
+    model_id: str = model.id
+    name = model_id.split("/")[-1]
+    size_bytes: int | None = None
+    if hasattr(model, "safetensors") and model.safetensors:
+        st_info = model.safetensors
+        if hasattr(st_info, "total"):
+            # total is parameter count; BF16 = 2 bytes/param
+            size_bytes = st_info.total * 2
+
+    disk_size = _hf_size_to_disk(size_bytes)
+    size_gi = _parse_disk_gi(disk_size)
+    gpu_count = 8 if size_gi >= 280 else 1
+
+    params_b = (size_bytes / 2 / 1e9) if size_bytes else None
+    if params_b:
+        if params_b < 10:
+            category = "Tiny / Fast"
+        elif params_b < 50:
+            category = "Balanced"
+        elif params_b < 100:
+            category = "Large"
+        else:
+            category = "Frontier"
+    else:
+        category = "Balanced"
+
+    is_gated = bool(model.gated) if hasattr(model, "gated") and model.gated else False
+
+    downloads = getattr(model, "downloads", 0) or 0
+    likes     = getattr(model, "likes", 0) or 0
+
+    return {
+        "id": model_id.lower().replace("/", "-").replace(".", "-"),
+        "display_name": name,
+        "category": category,
+        "description": (
+            f"HuggingFace · {model_id}"
+            + (f" · {params_b:.1f}B params" if params_b else "")
+            + f" · {downloads:,} downloads · {likes:,} likes"
+        ),
+        "image": "vllm/vllm-openai:latest",
+        "model_id": model_id,
+        "served_model_name": name,
+        "platform": "gpu-h200-sxm",
+        "gpu_count": gpu_count,
+        "max_model_len": 4096,
+        "max_tokens": 512,
+        "disk_size": disk_size,
+        "gated": is_gated,
+    }
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _search_hf_models(query: str, limit: int = 30) -> list[dict[str, Any]]:
+    """Search HuggingFace for text-generation models; returns list of config dicts."""
+    from huggingface_hub import list_models
+    results = list(list_models(
+        search=query,
+        pipeline_tag="text-generation",
+        sort="downloads",
+        limit=limit,
+        expand=["safetensors", "downloads", "likes", "gated"],
+    ))
+    return [_hf_model_to_cfg(m) for m in results]
+
+
+def _pick_from_catalogue(models: list[dict[str, Any]]) -> dict[str, Any] | None:
     by_name = {m["display_name"]: m for m in models}
     categories: dict[str, list[str]] = {}
     for m in models:
@@ -458,6 +574,66 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
     cfg = by_name.get(selected)
     if cfg:
         st.caption(f"{cfg.get('description','')}  |  default {cfg.get('gpu_count',1)}× GPU · disk: {cfg.get('disk_size','—')}")
+    return cfg
+
+
+def _pick_from_hf() -> dict[str, Any] | None:
+    c1, c2 = st.columns([4, 1])
+    query = c1.text_input(
+        "Search HuggingFace",
+        placeholder="e.g. llama, qwen, mistral, deepseek…",
+        label_visibility="collapsed",
+        key="hf_query_input",
+    )
+    search_clicked = c2.button("Search", type="primary", use_container_width=True)
+
+    if "hf_search_results" not in st.session_state:
+        st.session_state.hf_search_results = []
+    if "hf_search_query_last" not in st.session_state:
+        st.session_state.hf_search_query_last = ""
+
+    if search_clicked and query.strip():
+        with st.spinner(f'Searching HuggingFace for "{query}"…'):
+            st.session_state.hf_search_results = _search_hf_models(query.strip())
+            st.session_state.hf_search_query_last = query.strip()
+
+    results: list[dict[str, Any]] = st.session_state.hf_search_results
+    if not results:
+        st.caption("Returns top-30 text-generation models sorted by downloads.")
+        return None
+
+    st.caption(f'{len(results)} models for "{st.session_state.hf_search_query_last}" · sorted by downloads')
+    idx = st.selectbox(
+        "HF Model",
+        range(len(results)),
+        format_func=lambda i: results[i]["model_id"],
+        label_visibility="collapsed",
+    )
+    cfg = results[idx]
+    st.caption(cfg.get("description", ""))
+    if cfg.get("gated"):
+        st.info("🔒 Gated model — HuggingFace token with license acceptance required.")
+    return cfg
+
+
+def _section_idle(models: list[dict[str, Any]]) -> None:
+    source = st.radio(
+        "Model source",
+        ["📋 Catalogue", "🤗 HuggingFace Search"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if source == "📋 Catalogue":
+        cfg = _pick_from_catalogue(models)
+    else:
+        cfg = _pick_from_hf()
+        if cfg is None:
+            return  # no search done yet — don't render the rest
+
+    if cfg is None:
+        return
 
     st.divider()
     st.markdown("**GPU Platform**")
@@ -493,11 +669,29 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
             f"but **{cfg['display_name']}** needs ~{vram_needs} GB. "
             f"Consider more GPUs or H200 / B200."
         )
+    price_per_gpu = GPU_PRICE_PER_HOUR.get(sel_platform["id"], 0.0)
+    hourly_total  = price_per_gpu * selected_gpu_count
+    session_cost  = hourly_total * _ESTIMATED_SESSION_HOURS
     try:
         preset_preview = resolve_preset(selected_gpu_count, sel_platform["id"])
-        st.caption(f"Preset: `{preset_preview}` — {selected_gpu_count} × {sel_platform['name']}  ·  {total_vram} GB total VRAM")
+        st.caption(f"Preset: `{preset_preview}` — {selected_gpu_count} × {sel_platform['name']} · {total_vram} GB VRAM")
+        st.caption(f"💰 ${hourly_total:.2f} / hr · ~${session_cost:.2f} / session · [nebius.com/prices](https://nebius.com/prices)")
     except ValueError as exc:
         st.error(str(exc))
+
+    st.divider()
+    st.markdown("**Disk Size**")
+    default_disk_gi = max(120, _parse_disk_gi((cfg or {}).get("disk_size", "120Gi")))
+    disk_gi = st.number_input(
+        "Disk Size (Gi)",
+        min_value=120,
+        value=default_disk_gi,
+        step=10,
+        label_visibility="collapsed",
+        help="Minimum 120 Gi. Large models (70B+) need 300–1000 Gi.",
+    )
+    disk_size_str = f"{int(disk_gi)}Gi"
+    st.caption(f"Disk: `{disk_size_str}`")
 
     st.divider()
     st.markdown("**Inference Engine**")
@@ -517,22 +711,165 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
     selected_engine = engine_keys[engine_labels.index(engine_choice)]
     eng_image, eng_desc = ENGINE_OPTIONS[selected_engine][1], ENGINE_OPTIONS[selected_engine][2]
     st.caption(f"`{eng_image}` — {eng_desc}")
+    if selected_engine == "sglang" and sel_platform["id"] == "gpu-rtx6000":
+        st.warning(
+            "⚠️ **SGLang + RTX 6000 is unreliable.** SGLang's kernels target H100/A100 — "
+            "JIT compilation consistently fails on RTX 6000 Ada. Use **vLLM** on this platform, "
+            "or switch to H200/B200 if you need SGLang."
+        )
 
     st.divider()
-    st.markdown("**Disk Size**")
-    default_disk_gi = max(120, _parse_disk_gi((cfg or {}).get("disk_size", "120Gi")))
-    disk_gi = st.number_input(
-        "Disk Size (Gi)",
-        min_value=120,
-        value=default_disk_gi,
-        step=10,
-        label_visibility="collapsed",
-        help="Minimum 120 Gi. Large models (70B+) need 300–1000 Gi.",
-    )
-    disk_size_str = f"{int(disk_gi)}Gi"
-    st.caption(f"Disk: `{disk_size_str}`")
+    with st.expander("⚙️ Advanced Options"):
+        st.caption(
+            "Wrong combinations can cause the endpoint to fail after a ~10 min wait — read the warnings carefully."
+        )
 
-    st.divider()
+        # ── Shared: quantization · dtype · image tag ───────────────────────────
+        sh1, sh2, sh3 = st.columns(3)
+        quantization = sh1.selectbox(
+            "Quantization",
+            ["none", "fp8", "awq", "gptq"],
+            index=0,
+            help=(
+                "**none** — full precision (safest).\n\n"
+                "**fp8** — 8-bit float, ~50% less VRAM. Requires an FP8 checkpoint on HuggingFace.\n\n"
+                "**awq** — 4-bit AWQ. Requires a pre-quantized AWQ checkpoint.\n\n"
+                "**gptq** — 4-bit GPTQ. Requires a pre-quantized GPTQ checkpoint."
+            ),
+        )
+        dtype = sh2.selectbox(
+            "dtype",
+            ["auto", "bfloat16", "float16"],
+            index=0,
+            help=(
+                "**auto** — engine picks best dtype (recommended).\n\n"
+                "**bfloat16** — better numerical range, preferred on H200/B200.\n\n"
+                "**float16** — slightly faster on older GPUs, can overflow on large models."
+            ),
+        )
+        image_tag = sh3.text_input(
+            "Image Tag",
+            value="latest",
+            help=(
+                "Docker image tag. Use `latest` or pin to a release like `v0.8.5`.\n\n"
+                "⚠️ Must exist on Docker Hub — an invalid tag fails at pull time."
+            ),
+        )
+
+        st.divider()
+
+        # ── Engine-specific ────────────────────────────────────────────────────
+        if selected_engine == "vllm":
+            st.caption("**vLLM options**")
+            v1, v2, v3 = st.columns(3)
+            gpu_memory_utilization = v1.slider(
+                "GPU Memory Utilization",
+                min_value=0.50, max_value=1.00, value=0.90, step=0.01,
+                help=(
+                    "Fraction of VRAM for model + KV cache (default 0.90).\n\n"
+                    "Higher → more KV cache → better throughput.\n\n"
+                    "Lower → safer if model is close to VRAM limit.\n\n"
+                    "⚠️ Above 0.95: high OOM risk. Below 0.60: very limited KV cache."
+                ),
+            )
+            enable_prefix_caching = v2.toggle(
+                "Prefix Caching",
+                value=False,
+                help=(
+                    "Caches KV states of shared prompt prefixes across requests.\n\n"
+                    "Only useful when many requests share the same system prompt. "
+                    "No benefit for diverse/random prompts."
+                ),
+            )
+            max_num_seqs = v3.number_input(
+                "Max Sequences  (0 = vLLM default 256)",
+                min_value=0, max_value=1024, value=0, step=8,
+                help=(
+                    "Max sequences the engine batches simultaneously.\n\n"
+                    "Higher → better GPU utilisation under load, more memory pressure.\n\n"
+                    "Lower → more predictable latency under light load."
+                ),
+            )
+            # SGLang defaults (unused)
+            mem_fraction_static  = 0.88
+            disable_radix_cache  = False
+            max_running_requests = 0
+            attention_backend    = "flashinfer"
+
+        else:  # sglang
+            st.caption("**SGLang options**")
+            s1, s2, s3, s4 = st.columns(4)
+            mem_fraction_static = s1.slider(
+                "Memory Fraction Static",
+                min_value=0.50, max_value=1.00, value=0.88, step=0.01,
+                help=(
+                    "Fraction of VRAM reserved for the KV cache pool (SGLang default 0.88).\n\n"
+                    "Equivalent to vLLM's gpu-memory-utilization.\n\n"
+                    "⚠️ Above 0.95: OOM risk. Below 0.60: very limited KV cache."
+                ),
+            )
+            radix_on = s2.toggle(
+                "RadixAttention  (Prefix Cache)",
+                value=True,
+                help=(
+                    "SGLang's RadixAttention reuses KV cache for shared prompt prefixes. "
+                    "Enabled by default — gives big TTFT wins for repeated system prompts.\n\n"
+                    "Turn off only if you're debugging or using a workload with no shared prefixes."
+                ),
+            )
+            disable_radix_cache = not radix_on
+            max_running_requests = s3.number_input(
+                "Max Running Requests  (0 = default)",
+                min_value=0, max_value=1024, value=0, step=8,
+                help=(
+                    "Max concurrent requests SGLang processes simultaneously.\n\n"
+                    "Leave at 0 to use SGLang's default (based on available memory)."
+                ),
+            )
+            _attn_options = ["flashinfer", "triton", "torch_native"]
+            _attn_default = 1 if sel_platform["id"] == "gpu-rtx6000" else 0
+            attention_backend = s4.selectbox(
+                "Attention Backend",
+                _attn_options,
+                index=_attn_default,
+                help=(
+                    "**flashinfer** — fastest, recommended for H200/B200.\n\n"
+                    "**triton** — architecture-agnostic, recommended for RTX 6000.\n\n"
+                    "**torch_native** — slowest, most compatible."
+                ),
+            )
+            # vLLM defaults (unused)
+            gpu_memory_utilization = 0.90
+            enable_prefix_caching  = False
+            max_num_seqs           = 0
+
+        # ── Guardrails ─────────────────────────────────────────────────────────
+        if quantization in ("awq", "gptq"):
+            st.warning(
+                f"⚠️ **{quantization.upper()} requires a pre-quantized checkpoint.** "
+                f"The model on HuggingFace must already be in {quantization.upper()} format. "
+                f"Applying this to a standard FP16 checkpoint will fail."
+            )
+        if quantization == "fp8":
+            st.warning(
+                "⚠️ **FP8 requires an FP8-quantized checkpoint.** "
+                "Check HuggingFace for an `-FP8` variant of your model before deploying."
+            )
+        mem_util = mem_fraction_static if selected_engine == "sglang" else gpu_memory_utilization
+        mem_label = "mem-fraction-static" if selected_engine == "sglang" else "gpu-memory-utilization"
+        if mem_util > 0.95:
+            st.warning(f"⚠️ **{mem_label} {mem_util:.2f} is very high** — high OOM risk during model loading.")
+        if mem_util < 0.60:
+            st.warning(f"⚠️ **{mem_label} {mem_util:.2f} is very low** — KV cache will be severely limited.")
+        if selected_engine == "sglang" and attention_backend == "flashinfer" and sel_platform["id"] == "gpu-rtx6000":
+            st.warning(
+                "⚠️ **flashinfer may not be supported on RTX 6000 Ada.** "
+                "The `lmsysorg/sglang:latest` image's flashinfer build targets H100/H200. "
+                "Switch to **triton** or **torch_native** to avoid a StartFailed error."
+            )
+        if image_tag.strip() not in ("latest", "") and not image_tag.strip().startswith("v"):
+            st.info(f"ℹ️ Image tag `{image_tag.strip()}` — make sure it exists on Docker Hub.")
+
     is_gated = bool(cfg and cfg.get("gated"))
     col_tok, col_btn = st.columns([3, 1])
     with col_tok:
@@ -552,8 +889,18 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
                     engine=selected_engine,
                     gpu_count_override=selected_gpu_count,
                     disk_size_override=disk_size_str,
+                    image_tag=image_tag.strip() or "latest",
+                    quantization=quantization,
+                    dtype=dtype,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    enable_prefix_caching=enable_prefix_caching,
+                    max_num_seqs=int(max_num_seqs) if max_num_seqs else 0,
+                    mem_fraction_static=mem_fraction_static,
+                    disable_radix_cache=disable_radix_cache,
+                    max_running_requests=int(max_running_requests) if max_running_requests else 0,
+                    attention_backend=attention_backend,
                 )
-                st.rerun()
+                st.switch_page("pages/6_Endpoint_Management.py")
 
 
 def _section_creating() -> None:
@@ -564,28 +911,15 @@ def _section_creating() -> None:
         if job.get("error"):
             st.session_state.workflow = "error"
             st.session_state.error_message = job["error"]
+            st.rerun()
         else:
             r = job["result"]
             st.session_state.endpoint_id       = r.endpoint_id
             st.session_state.creation_duration = r.creation_duration_seconds
             st.session_state.workflow          = "submitted"
-        st.rerun()
+            st.rerun()
     else:
         time.sleep(REFRESH_INTERVAL); st.rerun()
-
-
-def _section_submitted() -> None:
-    cfg = st.session_state.model_config or {}
-    eid = st.session_state.endpoint_id or "—"
-
-    st.success("✅ Request sent successfully!")
-    st.markdown(
-        f"**{cfg.get('display_name', 'Endpoint')}** has been submitted for deployment.  \n"
-        f"Endpoint ID: `{eid}`"
-    )
-    st.info("Provisioning typically takes 5–10 minutes. Head to **Endpoint Management** to monitor the status.")
-    st.page_link("pages/6_Endpoint_Management.py", label="📡 Go to Endpoint Management →", use_container_width=False)
-    st.divider()
     if st.button("↩ Deploy another endpoint"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
@@ -619,7 +953,7 @@ def _spawn_warmup(endpoint_url: str, auth_token: str | None) -> None:
 
     def _run() -> None:
         while not job["done"]:
-            if check_serve_ready(endpoint_url, auth_token):
+            if check_serve_ready(endpoint_url, auth_token)[0]:
                 job["ready"] = True
                 job["done"]  = True
             else:
@@ -816,7 +1150,7 @@ def main() -> None:
     st.header("1. Endpoint Deployment")
     if w == "idle":          _section_idle(models)
     elif w == "creating":    _section_creating()
-    elif w == "submitted":   _section_submitted()
+    elif w == "submitted":   st.switch_page("pages/6_Endpoint_Management.py")
     elif w == "polling":     _section_polling()
     elif w == "warming":     _section_warming()
     elif w == "ready":       _section_ready()
