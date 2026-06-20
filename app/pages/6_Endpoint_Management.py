@@ -39,25 +39,28 @@ _STATE_BADGE = {
 _SERVE_CHECK_TTL = 30  # seconds between health-check refreshes per endpoint
 
 
-def _serve_badge(ep: EndpointInfo) -> tuple[str, str, str]:
-    """Synchronous health-check badge for RUNNING endpoints.
+def _serve_badge(ep: EndpointInfo) -> tuple[str, str, str, str]:
+    """Return (icon, label, bg, detail) for a RUNNING endpoint.
 
-    A 502/refused connection returns in <50ms; a ready server in <200ms.
-    Results are cached in session state for _SERVE_CHECK_TTL seconds so
-    subsequent reruns are instant.
+    Result is cached for _SERVE_CHECK_TTL seconds.
     """
-    cache_key = f"serve_ready_{ep.endpoint_id}"
-    ts_key    = f"serve_ready_ts_{ep.endpoint_id}"
+    cache_key  = f"serve_ready_{ep.endpoint_id}"
+    detail_key = f"serve_detail_{ep.endpoint_id}"
+    ts_key     = f"serve_ready_ts_{ep.endpoint_id}"
 
     cached_at = st.session_state.get(ts_key, 0)
     if cache_key not in st.session_state or time.time() - cached_at > _SERVE_CHECK_TTL:
-        ready = check_serve_ready(ep.url or "", ep.auth_token, timeout=1)
-        st.session_state[cache_key] = ready
-        st.session_state[ts_key]    = time.time()
+        ready, detail = check_serve_ready(ep.url or "", ep.auth_token, timeout=3)
+        st.session_state[cache_key]  = ready
+        st.session_state[detail_key] = detail
+        st.session_state[ts_key]     = time.time()
 
-    if st.session_state[cache_key]:
-        return ("🟢", "READY TO SERVE", "#1a4731")
-    return ("🟡", "CONTAINER UP", "#2a3d06")
+    ready  = st.session_state[cache_key]
+    detail = st.session_state.get(detail_key, "")
+
+    if ready:
+        return ("🟢", "READY TO SERVE", "#1a4731", "")
+    return ("🟡", "CONTAINER UP", "#2a3d06", detail)
 
 
 def _fmt_ts(ts: str | None) -> str:
@@ -112,12 +115,14 @@ def _spawn_delete(endpoint_id: str) -> dict:
     return job
 
 
-def _render_test_panel(ep: EndpointInfo) -> None:
+def _render_test_panel(ep: EndpointInfo, ready: bool = True) -> None:
     """Inline API test panel for a running endpoint."""
     from openai import OpenAI
 
     eid = ep.endpoint_id
     with st.expander("🧪 Test API", expanded=False):
+        if not ready:
+            st.info("⏳ Model server is still loading — test will be enabled once the endpoint is ready to serve.")
 
         # ── Controls ────────────────────────────────────────────────────────
         c1, c2, c3 = st.columns([3, 2, 2])
@@ -158,7 +163,7 @@ def _render_test_panel(ep: EndpointInfo) -> None:
             send = st.button(
                 "▶ Send", key=f"t_send_{eid}",
                 type="primary", use_container_width=True,
-                disabled=not model_name.strip(),
+                disabled=not ready or not model_name.strip(),
             )
 
         if not send:
@@ -254,9 +259,10 @@ def _render_card(ep: EndpointInfo) -> None:
     is_error     = ep.state in (EndpointState.FAILED, EndpointState.UNKNOWN) or ep.state.value == "ERROR"
 
     if ep.state == EndpointState.RUNNING:
-        icon, label, bg = _serve_badge(ep)
+        icon, label, bg, serve_detail = _serve_badge(ep)
     else:
         icon, label, bg = _STATE_BADGE.get(ep.state, ("⚪", ep.state.value, "#2a2a2a"))
+        serve_detail = ""
 
     is_serve_ready = label == "READY TO SERVE"
 
@@ -284,6 +290,8 @@ def _render_card(ep: EndpointInfo) -> None:
                 f'{icon} {label}</span>',
                 unsafe_allow_html=True,
             )
+            if serve_detail:
+                st.caption(serve_detail)
 
         with col_bench:
             if is_serve_ready:
@@ -349,7 +357,7 @@ def _render_card(ep: EndpointInfo) -> None:
                 st.code(ep.image, language="text")
 
         if is_running and ep.url:
-            _render_test_panel(ep)
+            _render_test_panel(ep, ready=is_serve_ready)
 
 
 # ── Also handle "ERROR" state in EndpointState ─────────────────────────────────
@@ -428,6 +436,16 @@ any_deleting = any(
 for ep in sorted(visible, key=_sort_key):
     _render_card(ep)
 
+# Auto-refresh while any RUNNING endpoint isn't serve-ready yet
+any_loading = any(
+    e.state == EndpointState.RUNNING
+    and not st.session_state.get(f"serve_ready_{e.endpoint_id}", False)
+    for e in visible
+)
+
 if any_deleting:
     time.sleep(2)
+    st.rerun()
+elif any_loading:
+    time.sleep(_SERVE_CHECK_TTL)
     st.rerun()
