@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 import time
+from pathlib import Path
 from typing import Any
 
 import plotly.graph_objects as go
 
 from benchmark.benchmark_runner import BenchmarkResults
+
+_LOGO_PATH = Path(__file__).parent.parent / "app" / "assets" / "nebius-logo-white.png"
+
+
+def _logo_b64() -> str:
+    try:
+        return base64.b64encode(_LOGO_PATH.read_bytes()).decode()
+    except FileNotFoundError:
+        return ""
 
 
 def _fig_to_div(fig: go.Figure) -> str:
@@ -97,6 +108,12 @@ def generate_html_report(
     if deletion_time_seconds is not None:
         metric_rows += "\n" + _row("Deletion Time", f"{deletion_time_seconds:.1f}s")
 
+    logo_b64 = _logo_b64()
+    logo_html = (
+        f'<img src="data:image/png;base64,{logo_b64}" alt="Nebius" style="height:36px;margin-bottom:8px;">'
+        if logo_b64 else ""
+    )
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -104,25 +121,30 @@ def generate_html_report(
   <title>Nebius Benchmark Report — {model}</title>
   <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <style>
-    body  {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-             background: #0e1117; color: #e0e0e0; margin: 0; padding: 0; }}
-    .wrap {{ max-width: 1100px; margin: 0 auto; padding: 32px 24px; }}
-    h1    {{ color: #636EFA; margin-bottom: 4px; }}
-    .sub  {{ color: #888; margin-bottom: 32px; font-size: 0.9rem; }}
-    h2    {{ color: #aaa; font-size: 1rem; text-transform: uppercase;
-             letter-spacing: 0.08em; margin: 32px 0 12px; border-bottom: 1px solid #333; padding-bottom: 6px; }}
-    table {{ border-collapse: collapse; width: 100%; max-width: 540px; margin-bottom: 16px; }}
-    td    {{ padding: 8px 12px; border-bottom: 1px solid #333; font-size: 0.9rem; }}
+    body   {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+              background: #0e1117; color: #e0e0e0; margin: 0; padding: 0; }}
+    .wrap  {{ max-width: 1100px; margin: 0 auto; padding: 32px 24px; }}
+    .hdr   {{ display: flex; align-items: center; gap: 24px; margin-bottom: 4px; }}
+    .hdr img {{ height: 36px; }}
+    h1     {{ color: #fff; margin: 0; font-size: 1.5rem; }}
+    .sub   {{ color: #888; margin-bottom: 32px; font-size: 0.9rem; }}
+    h2     {{ color: #aaa; font-size: 1rem; text-transform: uppercase;
+              letter-spacing: 0.08em; margin: 32px 0 12px; border-bottom: 1px solid #333; padding-bottom: 6px; }}
+    table  {{ border-collapse: collapse; width: 100%; max-width: 540px; margin-bottom: 16px; }}
+    td     {{ padding: 8px 12px; border-bottom: 1px solid #333; font-size: 0.9rem; }}
     td:first-child {{ color: #888; width: 220px; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
-    .card {{ background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 8px; padding: 16px; }}
+    .grid  {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+    .card  {{ background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 8px; padding: 16px; }}
     @media (max-width: 700px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-    footer{{ margin-top: 48px; color: #555; font-size: 0.8rem; text-align: center; }}
+    footer {{ margin-top: 48px; color: #555; font-size: 0.8rem; text-align: center; }}
   </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🔬 Nebius Endpoint Benchmark Report</h1>
+  <div class="hdr">
+    {logo_html}
+    <h1>Endpoint Benchmark Report</h1>
+  </div>
   <div class="sub">Generated {ts} &nbsp;·&nbsp; Model: {model}</div>
 
   <h2>Summary</h2>

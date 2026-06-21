@@ -55,7 +55,7 @@ def generate_markdown_report(
             f"| {k} | {v} |" for k, v in rows
         )
 
-    return f"""# Nebius AI Endpoint Benchmark Report
+    return f"""# ![Nebius](../app/assets/nebius-logo-white.png) Endpoint Benchmark Report
 
 ## Lifecycle
 
