@@ -116,57 +116,128 @@ def _spawn_delete(endpoint_id: str) -> dict:
 
 
 def _render_test_panel(ep: EndpointInfo, ready: bool = True) -> None:
-    """Inline API test panel for a running endpoint."""
+    """Inline chat panel for a running endpoint."""
     from openai import OpenAI
 
-    eid = ep.endpoint_id
+    eid         = ep.endpoint_id
+    history_key = f"t_history_{eid}"
+    prompt_key  = f"t_prompt_{eid}"
+
+    if history_key not in st.session_state:
+        st.session_state[history_key] = []
+
+    # Both prefill and deferred-clear must happen BEFORE the textarea widget
+    # is instantiated — Streamlit forbids modifying a widget key after render.
+    if f"t_prefill_{eid}" in st.session_state:
+        st.session_state[prompt_key] = st.session_state.pop(f"t_prefill_{eid}")
+    elif st.session_state.pop(f"t_do_clear_{eid}", False):
+        st.session_state.pop(prompt_key, None)
+
     with st.expander("🧪 Test API", expanded=False):
         if not ready:
-            st.info("⏳ Model server is still loading — test will be enabled once the endpoint is ready to serve.")
+            st.info("⏳ Model server is still loading — chat will be enabled once it is ready to serve.")
 
-        # ── Controls ────────────────────────────────────────────────────────
-        c1, c2, c3 = st.columns([3, 2, 2])
-        with c1:
-            model_name = st.text_input(
-                "Model name", value=ep.model or "",
-                key=f"t_model_{eid}",
-                help="The served_model_name the endpoint was started with.",
-            )
-        with c2:
-            temperature = st.slider(
-                "Temperature", 0.0, 2.0, 0.7, 0.05, key=f"t_temp_{eid}",
-            )
-        with c3:
-            max_tokens = st.number_input(
-                "Max tokens", min_value=1, max_value=4096, value=256, step=64,
-                key=f"t_maxtok_{eid}",
-            )
+        # ── Toolbar ───────────────────────────────────────────────────────────
+        tb_left, tb_right = st.columns([6, 1])
+        with tb_left:
+            st.caption(f"🤖 **{ep.model or 'Model'}** · multi-turn chat")
+        with tb_right:
+            if st.button("✚ New Chat", key=f"t_clear_{eid}", use_container_width=True):
+                st.session_state[history_key] = []
+                if prompt_key in st.session_state:
+                    del st.session_state[prompt_key]
+                st.rerun()
 
-        with st.expander("System prompt (optional)", expanded=False):
+        # ── Settings (flat, no nested expander) ───────────────────────────────
+        with st.container(border=True):
+            s1, s2, s3, s4, s5 = st.columns([3, 2, 2, 1, 1])
+            with s1:
+                model_name = st.text_input(
+                    "Model", value=ep.model or "", key=f"t_model_{eid}",
+                    help="The served_model_name the endpoint was started with.",
+                )
+            with s2:
+                temperature = st.slider("Temp", 0.0, 2.0, 0.7, 0.05, key=f"t_temp_{eid}")
+            with s3:
+                max_tokens = st.number_input(
+                    "Max tokens", min_value=1, max_value=8192, value=512, step=64,
+                    key=f"t_maxtok_{eid}",
+                )
+            with s4:
+                streaming = st.checkbox("Stream", value=True, key=f"t_stream_{eid}")
+            with s5:
+                show_raw = st.checkbox("Raw", value=False, key=f"t_raw_{eid}")
             system_prompt = st.text_area(
-                "System prompt", value="", key=f"t_sys_{eid}",
+                "System prompt (optional)", key=f"t_sys_{eid}",
                 placeholder="You are a helpful assistant.",
-                label_visibility="collapsed",
+                height=60,
             )
 
-        prompt = st.text_area(
-            "User prompt", value="Hello! Briefly describe what you can do.",
-            key=f"t_prompt_{eid}", height=80,
-        )
+        st.divider()
 
-        ctl1, ctl2, ctl3 = st.columns([2, 2, 2])
-        with ctl1:
-            streaming = st.checkbox("Streaming", value=True, key=f"t_stream_{eid}")
-        with ctl2:
-            show_raw = st.checkbox("Show raw JSON", value=False, key=f"t_raw_{eid}")
-        with ctl3:
+        # ── Chat history ─────────────────────────────────────────────────────
+        history: list[dict] = st.session_state[history_key]
+
+        if not history:
+            with st.chat_message("assistant"):
+                st.markdown(
+                    f"👋 Hi! I'm **{ep.model or 'this model'}** running on this endpoint.\n\n"
+                    "Ask me anything — I can answer questions, write and explain code, "
+                    "summarise text, or help you explore what this model can do. "
+                    "What would you like to try?"
+                )
+            st.caption("Quick starts:")
+            sp1, sp2, sp3 = st.columns(3)
+            suggestions = [
+                ("💡 Capabilities", "What are you capable of? Give me a quick overview."),
+                ("🐍 Write code",   "Write a Python function that merges two sorted lists."),
+                ("📝 Summarise",    "Summarise the key ideas behind transformer neural networks in 3 bullet points."),
+            ]
+            for col, (label, text) in zip([sp1, sp2, sp3], suggestions):
+                if col.button(label, key=f"t_sugg_{eid}_{label}", use_container_width=True):
+                    st.session_state[f"t_prefill_{eid}"] = text
+                    st.rerun()
+        else:
+            for msg in history:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+                    if msg.get("metrics"):
+                        mcols = st.columns(len(msg["metrics"]))
+                        for mc, (k, v) in zip(mcols, msg["metrics"].items()):
+                            mc.caption(f"**{k}** {v}")
+
+        # ── Input ─────────────────────────────────────────────────────────────
+        inp_col, btn_col = st.columns([5, 1])
+        with inp_col:
+            prompt = st.text_area(
+                "Message", key=prompt_key,
+                placeholder="Type a message…",
+                height=80, label_visibility="collapsed",
+            )
+        with btn_col:
+            st.write("")
+            model_val = st.session_state.get(f"t_model_{eid}", ep.model or "")
             send = st.button(
-                "▶ Send", key=f"t_send_{eid}",
+                "Send ▶", key=f"t_send_{eid}",
                 type="primary", use_container_width=True,
-                disabled=not ready or not model_name.strip(),
+                disabled=not ready or not model_val.strip(),
             )
 
-        if not send:
+        if not send or not prompt.strip():
+            return
+
+        # Schedule input clear for next render (can't write widget key mid-run)
+        st.session_state[f"t_do_clear_{eid}"] = True
+
+        model_name    = st.session_state.get(f"t_model_{eid}",  ep.model or "")
+        temperature   = st.session_state.get(f"t_temp_{eid}",   0.7)
+        max_tokens    = st.session_state.get(f"t_maxtok_{eid}", 512)
+        streaming     = st.session_state.get(f"t_stream_{eid}", True)
+        show_raw      = st.session_state.get(f"t_raw_{eid}",    False)
+        system_prompt = st.session_state.get(f"t_sys_{eid}",    "")
+
+        if not model_name.strip():
+            st.error("Model name is required — fill it in the settings above.")
             return
 
         # ── Build client ─────────────────────────────────────────────────────
@@ -174,51 +245,69 @@ def _render_test_panel(ep: EndpointInfo, ready: bool = True) -> None:
         base_url = (ep.url or "").rstrip("/")
         if not base_url.endswith("/v1"):
             base_url = f"{base_url}/v1"
-
         if not base_url or base_url == "/v1":
             st.error("Endpoint has no public URL — cannot send request.")
             return
 
         client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
-        messages = []
-        if system_prompt.strip():
-            messages.append({"role": "system", "content": system_prompt.strip()})
-        messages.append({"role": "user", "content": prompt})
 
-        st.divider()
+        api_messages: list[dict] = []
+        if system_prompt.strip():
+            api_messages.append({"role": "system", "content": system_prompt.strip()})
+        for msg in history:
+            api_messages.append({"role": msg["role"], "content": msg["content"]})
+        api_messages.append({"role": "user", "content": prompt.strip()})
+
+        history.append({"role": "user", "content": prompt.strip()})
+        with st.chat_message("user"):
+            st.markdown(prompt.strip())
 
         # ── Streaming ────────────────────────────────────────────────────────
         if streaming:
-            response_placeholder = st.empty()
-            metrics_placeholder  = st.empty()
-            collected            = []
+            collected: list[str] = []
             ttft_ms: float | None = None
+            chunk_times: list[float] = []
             t0 = time.perf_counter()
-
             try:
-                with st.spinner("Waiting for first token…"):
-                    stream = client.chat.completions.create(
-                        model=model_name.strip(),
-                        messages=messages,
-                        max_tokens=int(max_tokens),
-                        temperature=temperature,
-                        stream=True,
+                with st.chat_message("assistant"):
+                    placeholder = st.empty()
+                    with st.spinner("Waiting for first token…"):
+                        stream = client.chat.completions.create(
+                            model=model_name.strip(),
+                            messages=api_messages,
+                            max_tokens=int(max_tokens),
+                            temperature=float(temperature),
+                            stream=True,
+                        )
+                    for chunk in stream:
+                        delta = (chunk.choices or [{}])[0]
+                        tok = getattr(getattr(delta, "delta", None), "content", None) or ""
+                        if tok:
+                            now = time.perf_counter()
+                            if ttft_ms is None:
+                                ttft_ms = (now - t0) * 1000
+                            else:
+                                chunk_times.append(now)
+                            collected.append(tok)
+                            placeholder.markdown("".join(collected) + "▌")
+
+                    full_response = "".join(collected)
+                    placeholder.markdown(full_response)
+                    total_ms = (time.perf_counter() - t0) * 1000
+                    itl_ms = (
+                        (chunk_times[-1] - chunk_times[0]) / max(len(chunk_times) - 1, 1) * 1000
+                        if len(chunk_times) > 1 else None
                     )
-
-                for chunk in stream:
-                    delta = (chunk.choices or [{}])[0]
-                    content = getattr(getattr(delta, "delta", None), "content", None) or ""
-                    if content:
-                        if ttft_ms is None:
-                            ttft_ms = (time.perf_counter() - t0) * 1000
-                        collected.append(content)
-                        response_placeholder.code("".join(collected), language=None)
-
-                total_ms = (time.perf_counter() - t0) * 1000
-                m1, m2 = metrics_placeholder.columns(2)
-                m1.metric("TTFT", f"{ttft_ms:.0f} ms" if ttft_ms else "—")
-                m2.metric("Total time", f"{total_ms:.0f} ms")
-
+                    metrics = {
+                        "TTFT":     f"{ttft_ms:.0f} ms" if ttft_ms else "—",
+                        "Total":    f"{total_ms:.0f} ms",
+                        "ITL":      f"{itl_ms:.1f} ms" if itl_ms else "—",
+                        "~Tokens":  str(len(collected)),
+                    }
+                    mcols = st.columns(len(metrics))
+                    for mc, (k, v) in zip(mcols, metrics.items()):
+                        mc.caption(f"**{k}** {v}")
+                history.append({"role": "assistant", "content": full_response, "metrics": metrics})
             except Exception as exc:
                 st.error(f"Request failed: {exc}")
 
@@ -229,26 +318,28 @@ def _render_test_panel(ep: EndpointInfo, ready: bool = True) -> None:
                 with st.spinner("Waiting for response…"):
                     resp = client.chat.completions.create(
                         model=model_name.strip(),
-                        messages=messages,
+                        messages=api_messages,
                         max_tokens=int(max_tokens),
-                        temperature=temperature,
+                        temperature=float(temperature),
                         stream=False,
                     )
                 total_ms = (time.perf_counter() - t0) * 1000
                 content  = (resp.choices[0].message.content or "") if resp.choices else ""
-
-                st.code(content, language=None)
-
-                usage = resp.usage
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Total time",        f"{total_ms:.0f} ms")
-                mc2.metric("Prompt tokens",     usage.prompt_tokens      if usage else "—")
-                mc3.metric("Completion tokens", usage.completion_tokens  if usage else "—")
-                mc4.metric("Total tokens",      usage.total_tokens       if usage else "—")
-
+                usage    = resp.usage
+                with st.chat_message("assistant"):
+                    st.markdown(content)
+                    metrics = {
+                        "Total":          f"{total_ms:.0f} ms",
+                        "Prompt tok":     str(usage.prompt_tokens)     if usage else "—",
+                        "Completion tok": str(usage.completion_tokens) if usage else "—",
+                        "Total tok":      str(usage.total_tokens)      if usage else "—",
+                    }
+                    mcols = st.columns(len(metrics))
+                    for mc, (k, v) in zip(mcols, metrics.items()):
+                        mc.caption(f"**{k}** {v}")
+                history.append({"role": "assistant", "content": content, "metrics": metrics})
                 if show_raw:
                     st.json(resp.model_dump())
-
             except Exception as exc:
                 st.error(f"Request failed: {exc}")
 
@@ -275,50 +366,54 @@ def _render_card(ep: EndpointInfo) -> None:
         return
 
     with st.container(border=True):
-        # ── Top row: name | badge | actions ────────────────────────────────
-        col_name, col_badge, col_bench, col_del = st.columns([4, 2, 1, 1])
+        # ── Top row: [name + badge] | [actions] ────────────────────────────
+        col_info, col_actions = st.columns([7, 3])
 
-        with col_name:
-            st.markdown(f"**{ep.name}**")
+        with col_info:
             short = ep.endpoint_id[-14:] if len(ep.endpoint_id) > 14 else ep.endpoint_id
-            st.caption(f"`{short}`")
+            name_col, badge_col = st.columns([4, 3])
+            with name_col:
+                st.markdown(f"**{ep.name}**")
+                st.caption(f"`{short}`")
+            with badge_col:
+                st.markdown(
+                    f'<span style="background:{bg};border-radius:6px;padding:4px 10px;'
+                    f'font-size:.82rem;font-weight:600;display:inline-block;margin-top:6px">'
+                    f'{icon} {label}</span>',
+                    unsafe_allow_html=True,
+                )
+                if serve_detail:
+                    st.caption(serve_detail)
 
-        with col_badge:
-            st.markdown(
-                f'<span style="background:{bg};border-radius:6px;padding:4px 10px;'
-                f'font-size:.82rem;font-weight:600;display:inline-block;margin-top:6px">'
-                f'{icon} {label}</span>',
-                unsafe_allow_html=True,
-            )
-            if serve_detail:
-                st.caption(serve_detail)
+        with col_actions:
+            btn_bench, btn_del = st.columns(2)
 
-        with col_bench:
-            if is_serve_ready:
-                if st.button("▶ Benchmark", key=f"bench_{ep.endpoint_id}",
-                             type="primary", use_container_width=True):
-                    _handoff(ep)
-            elif is_running:
-                st.caption("Loading…")
-            elif is_transient:
-                st.caption("Starting…")
+            with btn_bench:
+                if is_serve_ready:
+                    if st.button("▶ Benchmark", key=f"bench_{ep.endpoint_id}",
+                                 type="primary", use_container_width=True):
+                        _handoff(ep)
+                elif is_running:
+                    st.caption("Loading…")
+                elif is_transient:
+                    st.caption("Starting…")
 
-        with col_del:
-            job = st.session_state.get(deleting_key)
-            if job and not job["done"]:
-                st.caption("Deleting…")
-            elif job and job["done"] and job["success"]:
-                st.session_state[deleted_key] = True
-                st.rerun()
-            elif job and job["done"] and job["error"]:
-                st.error(f"Delete failed: {job['error']}", icon="🚨")
-            elif st.session_state.get(confirm_key):
-                pass  # confirm row rendered below
-            else:
-                if st.button("🗑️ Delete", key=f"del_{ep.endpoint_id}",
-                             type="secondary", use_container_width=True):
-                    st.session_state[confirm_key] = True
+            with btn_del:
+                job = st.session_state.get(deleting_key)
+                if job and not job["done"]:
+                    st.caption("Deleting…")
+                elif job and job["done"] and job["success"]:
+                    st.session_state[deleted_key] = True
                     st.rerun()
+                elif job and job["done"] and job["error"]:
+                    st.error(f"Delete failed: {job['error']}", icon="🚨")
+                elif st.session_state.get(confirm_key):
+                    pass  # confirm row rendered below
+                else:
+                    if st.button("🗑️ Delete", key=f"del_{ep.endpoint_id}",
+                                 type="secondary", use_container_width=True):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
 
         # ── Confirm row (shown when delete button was clicked) ─────────────
         if st.session_state.get(confirm_key):

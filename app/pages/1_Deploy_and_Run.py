@@ -51,9 +51,9 @@ REFRESH_INTERVAL = 2
 POLL_INTERVAL    = 5
 
 GPU_PLATFORMS: list[dict[str, Any]] = [
-    {"id": "gpu-h200-sxm", "name": "NVIDIA® H200 NVLink",   "vram_gb": 141, "label": "H200 NVLink  ·  141 GB  (recommended)"},
-    {"id": "gpu-b200-sxm", "name": "NVIDIA® B200 NVLink",   "vram_gb": 180, "label": "B200 NVLink  ·  180 GB  (highest memory)"},
-    {"id": "gpu-rtx6000",  "name": "NVIDIA® RTX PRO 6000",  "vram_gb": 96,  "label": "RTX PRO 6000  ·  96 GB  (budget / small models)"},
+    {"id": "gpu-h200-sxm", "name": "NVIDIA® H200 NVLink",  "vram_gb": 141, "label": "NVIDIA H200"},
+    {"id": "gpu-b200-sxm", "name": "NVIDIA® B200 NVLink",  "vram_gb": 180, "label": "NVIDIA B200"},
+    {"id": "gpu-rtx6000",  "name": "NVIDIA® RTX PRO 6000", "vram_gb": 96,  "label": "NVIDIA RTX PRO 6000"},
 ]
 _PLATFORM_BY_ID = {p["id"]: p for p in GPU_PLATFORMS}
 
@@ -219,7 +219,6 @@ def _spawn_create(
     job: dict[str, Any] = {"done": False, "result": None, "error": None}
     st.session_state.create_job        = job
     st.session_state.op_start          = time.time()
-    st.session_state.workflow          = "creating"
     st.session_state.selected_platform = platform_override or cfg["platform"]
     st.session_state.selected_engine   = engine
     effective_platform  = platform_override or cfg["platform"]
@@ -568,7 +567,21 @@ def _pick_from_catalogue(models: list[dict[str, Any]]) -> dict[str, Any] | None:
         sep = cat_labels.get(cat, f"── {cat} ──")
         options.append(sep); separators.add(sep); options.extend(names)
 
-    selected = st.selectbox("Select Model", options)
+    selected = st.selectbox(
+        "Select Model",
+        options,
+        help=(
+            "Choose a model from the curated catalogue.\n\n"
+            "**Tiny / Fast** — 1–8B params, 1× GPU, fastest cold-start and lowest cost.\n\n"
+            "**Balanced** — 10–50B params, 1× GPU on H200/B200 (≥141 GB VRAM).\n\n"
+            "**Large** — 65–75B params, requires 8× GPU (weights exceed single-GPU headroom).\n\n"
+            "**Frontier** — MoE or 100B+ models, requires 8× GPU.\n\n"
+            "🔒 Models marked gated require a HuggingFace token and license acceptance. "
+            "See the **Models** page in the sidebar for step-by-step instructions.\n\n"
+            "Selecting a model pre-fills GPU preset, disk size, and platform with recommended defaults — "
+            "you can override all of them below."
+        ),
+    )
     if selected in separators:
         selected = next(n for n in options if n not in separators)
     cfg = by_name.get(selected)
@@ -584,6 +597,13 @@ def _pick_from_hf() -> dict[str, Any] | None:
         placeholder="e.g. llama, qwen, mistral, deepseek…",
         label_visibility="collapsed",
         key="hf_query_input",
+        help=(
+            "Search the HuggingFace Hub for text-generation models.\n\n"
+            "Returns the top 30 results sorted by all-time downloads.\n\n"
+            "Filters automatically to `pipeline_tag=text-generation` so only LLMs appear.\n\n"
+            "Results include model size (from safetensors), download count, and gated status — "
+            "used to auto-fill disk size, GPU preset, and the token requirement below."
+        ),
     )
     search_clicked = c2.button("Search", type="primary", use_container_width=True)
 
@@ -608,6 +628,14 @@ def _pick_from_hf() -> dict[str, Any] | None:
         range(len(results)),
         format_func=lambda i: results[i]["model_id"],
         label_visibility="collapsed",
+        help=(
+            "Select a model from the search results.\n\n"
+            "Selecting a model automatically sets:\n"
+            "- **Disk size** — estimated from safetensors byte count + 30% headroom\n"
+            "- **GPU preset** — 1 GPU for models under ~200 GiB, 8 GPUs for larger\n"
+            "- **Gated** — whether a HuggingFace token is required\n\n"
+            "You can override disk size and GPU preset in the sections below."
+        ),
     )
     cfg = results[idx]
     st.caption(cfg.get("description", ""))
@@ -635,28 +663,81 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
     if cfg is None:
         return
 
-    st.divider()
-    st.markdown("**GPU Platform**")
-    default_idx = next((i for i, p in enumerate(GPU_PLATFORMS) if p["id"] == (cfg or {}).get("platform", "gpu-h200-sxm")), 0)
-    platform_labels = [p["label"] for p in GPU_PLATFORMS]
-    choice = st.radio("GPU Platform", platform_labels, index=default_idx, horizontal=True, label_visibility="collapsed")
-    sel_platform = GPU_PLATFORMS[platform_labels.index(choice)]
+    # ── HuggingFace token (gated models only) ─────────────────────────────────
+    is_gated = bool(cfg.get("gated", False))
+    hf = os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+    if is_gated:
+        st.divider()
+        hf = st.text_input(
+            "🔑 HuggingFace Token",
+            value=os.getenv("HUGGING_FACE_HUB_TOKEN", ""),
+            type="password",
+            placeholder="hf_xxxx…",
+            help=(
+                "Required for this gated model.\n\n"
+                "Your HuggingFace access token (starts with `hf_`).\n\n"
+                "You must also have accepted the model's license on HuggingFace before deploying. "
+                "Go to the model page on HuggingFace → click **Agree and access repository**.\n\n"
+                "**How to get a token:** huggingface.co/settings/tokens → New token → Read role.\n\n"
+                "**Persistent setup:** add `HUGGING_FACE_HUB_TOKEN=hf_xxx` to your `.env` file "
+                "and this field pre-fills automatically.\n\n"
+                "See the **Models** page for full step-by-step instructions."
+            ),
+        )
+        if not hf.strip():
+            st.warning(
+                "🔒 This model requires a HuggingFace token and license acceptance. "
+                "The **Create Endpoint** button will remain disabled until a token is provided. "
+                "See the [Models page](pages/0_Models.py) for setup instructions.",
+            )
 
     st.divider()
-    st.markdown("**GPU Preset**")
-    default_gpu_count = (cfg or {}).get("gpu_count", 1)
-    gpu_preset_labels = ["1 GPU", "8 GPUs"]
-    gpu_preset_values = [1, 8]
-    default_preset_idx = 1 if default_gpu_count == 8 else 0
-    preset_choice = st.radio(
-        "GPU Preset",
-        gpu_preset_labels,
-        index=default_preset_idx,
-        horizontal=True,
-        label_visibility="collapsed",
-        help="1 GPU for models ≤64 GB; 8 GPUs for 70B+ models.",
-    )
-    selected_gpu_count = gpu_preset_values[gpu_preset_labels.index(preset_choice)]
+    col_platform, col_preset, col_disk = st.columns(3)
+
+    with col_platform:
+        default_idx = next((i for i, p in enumerate(GPU_PLATFORMS) if p["id"] == (cfg or {}).get("platform", "gpu-h200-sxm")), 0)
+        platform_labels = [p["label"] for p in GPU_PLATFORMS]
+        choice = st.radio(
+            "GPU Platform",
+            platform_labels,
+            index=default_idx,
+            help=(
+                "The GPU hardware your endpoint runs on.\n\n"
+                "**NVIDIA H200 · 141 GB VRAM · $2.45/GPU/hr** *(recommended)*\n"
+                "Best price/performance ratio. Supports all model sizes in the catalogue. "
+                "H200 SXM uses NVLink for fast multi-GPU communication.\n\n"
+                "**NVIDIA B200 · 180 GB VRAM · $3.95/GPU/hr** *(highest memory)*\n"
+                "Newest Blackwell architecture. Extra headroom for very large models or "
+                "workloads needing maximum KV cache. Higher cost than H200.\n\n"
+                "**NVIDIA RTX PRO 6000 · 96 GB VRAM · $0.95/GPU/hr** *(budget)*\n"
+                "Most affordable option. Suitable for small models (≤30B params). "
+                "⚠️ SGLang's kernels target H100/A100 — use vLLM on this platform.\n\n"
+                "Changing the platform updates the VRAM warning and cost estimate below."
+            ),
+        )
+        sel_platform = GPU_PLATFORMS[platform_labels.index(choice)]
+
+    with col_preset:
+        default_gpu_count = (cfg or {}).get("gpu_count", 1)
+        gpu_preset_labels = ["1 GPU", "8 GPUs"]
+        gpu_preset_values = [1, 8]
+        default_preset_idx = 1 if default_gpu_count == 8 else 0
+        preset_choice = st.radio(
+            "GPU Preset",
+            gpu_preset_labels,
+            index=default_preset_idx,
+            help=(
+                "Number of GPUs allocated to the endpoint.\n\n"
+                "**1 GPU** — sufficient for models up to ~64 GB in BF16 (≤32B params on H200). "
+                "Faster cold-start, lower cost.\n\n"
+                "**8 GPUs** — required for 70B+ models whose weights exceed single-GPU VRAM. "
+                "Nebius only offers 1 or 8 GPU presets — there are no 2- or 4-GPU options.\n\n"
+                "The model's recommended preset is pre-selected automatically. "
+                "A VRAM warning appears below if your choice is insufficient for the selected model.\n\n"
+                "Cost scales linearly: 8 GPUs = 8× the hourly rate."
+            ),
+        )
+        selected_gpu_count = gpu_preset_values[gpu_preset_labels.index(preset_choice)]
 
     from orchestrator.create_endpoint import resolve_preset
     total_vram = sel_platform["vram_gb"] * selected_gpu_count
@@ -679,22 +760,31 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
     except ValueError as exc:
         st.error(str(exc))
 
-    st.divider()
-    st.markdown("**Disk Size**")
-    default_disk_gi = max(120, _parse_disk_gi((cfg or {}).get("disk_size", "120Gi")))
-    disk_gi = st.number_input(
-        "Disk Size (Gi)",
-        min_value=120,
-        value=default_disk_gi,
-        step=10,
-        label_visibility="collapsed",
-        help="Minimum 120 Gi. Large models (70B+) need 300–1000 Gi.",
-    )
-    disk_size_str = f"{int(disk_gi)}Gi"
-    st.caption(f"Disk: `{disk_size_str}`")
+    with col_disk:
+        default_disk_gi = max(120, _parse_disk_gi((cfg or {}).get("disk_size", "120Gi")))
+        disk_gi = st.number_input(
+            "Disk Size (Gi)",
+            min_value=120,
+            value=default_disk_gi,
+            step=10,
+            help=(
+                "Persistent disk attached to the endpoint VM. Holds the model weights downloaded from HuggingFace.\n\n"
+                "**Minimum: 120 Gi** (Nebius platform floor).\n\n"
+                "**Rough guide by model size:**\n"
+                "- ≤10B params → 120 Gi\n"
+                "- 10–30B params → 150–200 Gi\n"
+                "- 30–75B params → 200–300 Gi\n"
+                "- 70B+ / large MoE → 300–500 Gi\n"
+                "- Frontier MoE (235B, 671B) → 1 Ti\n\n"
+                "The model's recommended size is pre-filled. "
+                "If you pick a smaller disk than needed, the endpoint will fail during model download. "
+                "Slightly oversizing is safe and cheap."
+            ),
+        )
+        disk_size_str = f"{int(disk_gi)}Gi"
+        st.caption(f"Disk: `{disk_size_str}`")
 
     st.divider()
-    st.markdown("**Inference Engine**")
     ENGINE_OPTIONS = {
         "vllm":   ("vLLM",   "vllm/vllm-openai:latest",   "Battle-tested, widest model support"),
         "sglang": ("SGLang", "lmsysorg/sglang:latest",     "High-throughput RadixAttention engine"),
@@ -705,8 +795,16 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
         "Inference Engine",
         engine_labels,
         horizontal=True,
-        label_visibility="collapsed",
-        help="vLLM and SGLang both expose an OpenAI-compatible API.",
+        help=(
+            "The inference server running inside the endpoint container.\n\n"
+            "**vLLM** — battle-tested, widest model compatibility, strong community support. "
+            "Best default choice. Uses PagedAttention for efficient KV cache management.\n\n"
+            "**SGLang** — optimised for high-throughput workloads via RadixAttention (prefix caching on by default). "
+            "Can outperform vLLM on workloads with shared system prompts. "
+            "⚠️ Unreliable on RTX 6000 — kernels target H100/A100 architecture.\n\n"
+            "Both expose an OpenAI-compatible `/v1/chat/completions` and `/v1/completions` API, "
+            "so benchmarks work identically regardless of which engine you pick."
+        ),
     )
     selected_engine = engine_keys[engine_labels.index(engine_choice)]
     eng_image, eng_desc = ENGINE_OPTIONS[selected_engine][1], ENGINE_OPTIONS[selected_engine][2]
@@ -870,16 +968,9 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
         if image_tag.strip() not in ("latest", "") and not image_tag.strip().startswith("v"):
             st.info(f"ℹ️ Image tag `{image_tag.strip()}` — make sure it exists on Docker Hub.")
 
-    is_gated = bool(cfg and cfg.get("gated"))
-    col_tok, col_btn = st.columns([3, 1])
-    with col_tok:
-        label = "HuggingFace Token  ⚠️ Required" if is_gated else "HuggingFace Token  (optional)"
-        hf = st.text_input(label, value=os.getenv("HUGGING_FACE_HUB_TOKEN", ""), type="password",
-                           placeholder="hf_xxxx…")
-    with col_btn:
-        st.write("")
-        disabled = is_gated and not hf.strip()
-        if disabled: st.warning("Token required")
+    disabled = is_gated and not hf.strip()
+    _, btn_col, _ = st.columns([1, 2, 1])
+    with btn_col:
         if st.button("🚀 Create Endpoint", type="primary", use_container_width=True, disabled=disabled):
             if cfg:
                 st.session_state.model_config = cfg
@@ -900,7 +991,7 @@ def _section_idle(models: list[dict[str, Any]]) -> None:
                     max_running_requests=int(max_running_requests) if max_running_requests else 0,
                     attention_backend=attention_backend,
                 )
-                st.switch_page("pages/6_Endpoint_Management.py")
+                st.switch_page("pages/2_Endpoint_Management.py")
 
 
 def _section_creating() -> None:
@@ -1150,7 +1241,7 @@ def main() -> None:
     st.header("1. Endpoint Deployment")
     if w == "idle":          _section_idle(models)
     elif w == "creating":    _section_creating()
-    elif w == "submitted":   st.switch_page("pages/6_Endpoint_Management.py")
+    elif w == "submitted":   st.switch_page("pages/2_Endpoint_Management.py")
     elif w == "polling":     _section_polling()
     elif w == "warming":     _section_warming()
     elif w == "ready":       _section_ready()
